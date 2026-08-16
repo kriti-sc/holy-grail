@@ -1,15 +1,18 @@
 //! Counts the object-store requests one flush actually makes.
 //!
-//! `flush.rs` charges iceberg's opendal I/O by hand, with a hardcoded guess of
-//! three round trips per commit. This probe replaces the guess with a count.
+//! Under DuckLake there is no metadata I/O to the object store — snapshots, file
+//! lists and stats are Postgres rows. So a publish should make exactly **one**
+//! object-store write (the data file, by DuckDB) and land its catalog rows in
+//! Postgres. This probe is the evidence for that claim: run a concurrent
+//! `mc admin trace` on MinIO and confirm the FLUSH phase makes one PUT.
 //!
-//! Phases are separated by pauses so a concurrent `mc admin trace` can attribute
-//! each request to the phase that caused it. Run with:
+//! Phases are separated by pauses so the trace can attribute each request to the
+//! phase that caused it. Run with:
 //!
 //!     cargo run --example trace_flush
 
 use holy_grail::config::Config;
-use holy_grail::Engine;
+use holy_grail::{catalog, Engine};
 use std::time::Duration;
 
 const GAP: Duration = Duration::from_secs(4);
@@ -25,7 +28,13 @@ async fn main() {
     eprintln!("--- phase: idle (baseline) ---");
     tokio::time::sleep(GAP).await;
 
-    eprintln!("--- phase: open (table create + index load) ---");
+    eprintln!("--- phase: bootstrap (create table via forked duckdb) ---");
+    catalog::bootstrap(&cfg.duckdb, &cfg.catalog, &cfg.s3)
+        .await
+        .unwrap();
+    tokio::time::sleep(GAP).await;
+
+    eprintln!("--- phase: open (catalog resolve + index load, no object store) ---");
     let engine = Engine::open(cfg).await.unwrap();
     tokio::time::sleep(GAP).await;
 
@@ -41,7 +50,7 @@ async fn main() {
     }
     tokio::time::sleep(GAP).await;
 
-    eprintln!("--- phase: FLUSH (parquet write + iceberg commit) ---");
+    eprintln!("--- phase: FLUSH (stage local + DuckDB publish: expect 1 PUT) ---");
     engine.flush().await.unwrap();
     tokio::time::sleep(GAP).await;
 

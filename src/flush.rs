@@ -1,102 +1,51 @@
-//! Flush: the frozen memtable becomes a Parquet file in the Iceberg table.
+//! Flush: the frozen memtable becomes a Parquet file in the DuckLake table.
 //!
-//! This is the protocol that licenses the whole "disposable row tier" claim, so
-//! its ordering is the most load-bearing thing in the codebase:
+//! holy-grail **stages** the frozen memtable to a local Parquet file, then the
+//! forked DuckDB binary **publishes** it — reading the staging file and writing
+//! the real DuckLake data file to object storage plus all catalog rows, in one
+//! transaction. DuckDB is the "write the table" library here, the DuckLake analog
+//! of iceberg's `fast_append`: holy-grail keeps the orchestration (freeze,
+//! watermark, truncate, recovery), DuckDB does the metadata mechanics.
 //!
-//! 1. Check the published watermark. If it already covers this flush, the flush
-//!    has landed — skip straight to truncation.
-//! 2. Write PK-sorted Parquet (bloom filter on `pk`, per-row-group PK bounds).
-//! 3. Commit to Iceberg, stamping the watermark LSN into the snapshot summary.
+//! The protocol's ordering is unchanged and still load-bearing:
+//!
+//! 1. Check the published watermark. If it already covers this flush, skip to
+//!    truncation (a retry after a crash between publish and truncate).
+//! 2. Stage the memtable to a local Parquet file.
+//! 3. Publish via DuckDB — atomic: the whole snapshot lands or nothing does.
 //! 4. **Then** truncate the WAL.
 //! 5. Retire the memtable.
 //!
-//! Publish before truncate, never the reverse. Truncating first would, on a
-//! crash in between, leave records gone from the WAL and absent from the
-//! columnar level — an acknowledged write, lost. This order can only leave the
-//! WAL holding records that are already published, which recovery *skips*. A
-//! benign duplicate rather than an impossible hole.
+//! Publish before truncate, never the reverse. A crash in the window can only
+//! leave the WAL holding records that are already published, which recovery
+//! *skips* — a benign duplicate rather than an impossible hole.
 
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{Int32Array, Int64Array, LargeBinaryArray, LargeBinaryBuilder, RecordBatch};
-use iceberg::spec::DataFileFormat;
-use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
-};
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg_catalog_rest::RestCatalog;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
-use uuid::Uuid;
+use parquet::arrow::AsyncArrowWriter;
+use tokio::process::Command;
 
-use crate::error::Result;
-use crate::index::published_watermark;
+use crate::config::{CatalogConfig, DuckDbConfig, S3Config};
+use crate::error::{Error, Result};
 use crate::memtable::Memtable;
 use crate::record::{Lsn, Op};
-use crate::schema::{self, WATERMARK_PROP};
+use crate::schema::{self};
 use crate::store::LatencyProfile;
 
-/// Rows per Arrow batch handed to the writer. Purely a memory-shape knob.
+/// Rows per Arrow batch handed to the staging writer. A memory-shape knob only —
+/// the *lake* file's row groups are DuckDB's `parquet_row_group_size`, set at
+/// bootstrap, not this.
 const BATCH_ROWS: usize = 8192;
-
-/// Rows per Parquet row group.
-///
-/// The default is a million, which would put the whole file in one row group and
-/// make row-group pruning meaningless — a point read would fetch every column
-/// chunk in the file to find one key. Small row groups are what let a point read
-/// fetch only the slice that could hold the key. The cost is more metadata per
-/// file, which is a trade this workload wants to make.
-const ROW_GROUP_ROWS: usize = 8192;
-
-/// False-positive rate for the `pk` bloom filter.
-///
-/// A false positive costs a wasted row-group scan — the column chunks are
-/// fetched from the object store and the key is not there. Against an S3 round
-/// trip that is expensive, and the filter is small either way, so 0.01 is
-/// bought rather than parquet's default 0.05.
-const BLOOM_FPP: f64 = 0.01;
-
-/// Object-store round trips a commit makes that the latency shim cannot see.
-///
-/// Iceberg does its metadata I/O through opendal, not `object_store`, so none of
-/// it passes through `LatencyStore`. These counts were measured, not guessed:
-/// `mc admin trace` against MinIO while `examples/trace_flush.rs` performed one
-/// flush. See DECISIONS.md, "Charging the opendal hole".
-///
-/// Our own process, via iceberg's `FileIO`:
-///   PUT  manifest (`*-m0.avro`), PUT manifest list (`snap-*.avro`)
-///   GET  manifest list, GET manifest — the post-commit index refresh reads back
-///        what it just wrote.
-const COMMIT_CLIENT_PUTS: u32 = 2;
-const COMMIT_CLIENT_GETS: u32 = 2;
-
-/// The REST catalog's own S3 I/O, performed server-side inside the commit call.
-///
-/// We do not issue these, but we *block* on the HTTP request that does, so they
-/// are part of flush wall-clock time and therefore part of what drives
-/// backpressure. Charging them is the honest choice; leaving them out would make
-/// flush look faster than it can ever be.
-///   GET  current metadata.json (x3), PUT new metadata.json
-const COMMIT_CATALOG_PUTS: u32 = 1;
-const COMMIT_CATALOG_GETS: u32 = 3;
-
-/// Namespace for deriving deterministic commit UUIDs from watermarks.
-const COMMIT_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x68, 0x6f, 0x6c, 0x79, 0x67, 0x72, 0x61, 0x69, 0x6c, 0x77, 0x61, 0x74, 0x65, 0x72, 0x6d, 0x6b,
-]);
 
 /// What a flush did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Flushed {
-    /// Files were written and a snapshot was committed.
+    /// A file was written and a snapshot committed by DuckDB.
     Committed { watermark: Lsn, files: usize },
     /// The published watermark already covered this flush — a retry after a
-    /// crash between commit and truncate. Nothing was written.
+    /// crash between publish and truncate. Nothing was written.
     AlreadyPublished { watermark: Lsn },
     /// The memtable held nothing.
     Empty,
@@ -118,163 +67,137 @@ impl Flushed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
     Write { watermark: Lsn },
-    /// The published watermark already covers this memtable — this is a retry
-    /// after a crash between commit and truncate. Do not write, do not commit;
-    /// just truncate.
+    /// The published watermark already covers this memtable — a retry after a
+    /// crash between publish and truncate. Do not write; just truncate.
     AlreadyPublished { watermark: Lsn },
     Empty,
 }
 
 /// Decide what to do. **This is where idempotency lives, and nowhere else.**
 ///
-/// Note what it is *not*: iceberg's `set_commit_uuid` does not deduplicate. A
-/// retried commit with the same UUID still produces a second snapshot appending
-/// the same files — duplicate rows, silently. Relying on it would be a quiet
-/// correctness bug. The watermark check is the actual mechanism, and because
-/// watermarks are monotonic it is exact rather than heuristic.
-pub fn plan(table: &Table, memtable: &Memtable) -> Plan {
+/// `published` is the derived watermark (`MAX(lsn)` over live files). DuckDB's
+/// INSERT is not idempotent on its own — a retried publish would append a second
+/// file — so the watermark check is the actual mechanism. Because watermarks are
+/// monotonic it is exact, not heuristic: if `published >= this flush's max_lsn`,
+/// the flush already landed.
+pub fn plan(published: Lsn, memtable: &Memtable) -> Plan {
     if memtable.is_empty() {
         return Plan::Empty;
     }
     let watermark = memtable.max_lsn();
 
-    if watermark <= published_watermark(table) {
+    if watermark <= published {
         Plan::AlreadyPublished { watermark }
     } else {
         Plan::Write { watermark }
     }
 }
 
-/// Write a frozen memtable to the columnar level and publish it.
+/// Deterministic staging file name for a watermark.
 ///
-/// Returns the updated table. The caller truncates the WAL *after* this returns,
-/// never before.
+/// A flush that crashed after staging but before publishing leaves an orphan
+/// local file; the retry writes to the *same* name and overwrites it. The name
+/// sorts in watermark order, which makes a stray staging dir readable.
+pub fn staging_path(dir: &Path, watermark: Lsn) -> PathBuf {
+    dir.join(format!("hg-stage-{watermark:020}.parquet"))
+}
+
+/// Stage the frozen memtable to a local Parquet file. Does not publish it.
 ///
-/// The two halves — write and commit — are also exposed separately, because the
-/// crash harness has to be able to die in the window between them.
-pub async fn flush(
-    table: &Table,
-    catalog: &RestCatalog,
-    memtable: &Memtable,
-    latency: LatencyProfile,
-) -> Result<(Table, Flushed)> {
-    let watermark = match plan(table, memtable) {
-        Plan::Empty => return Ok((table.clone(), Flushed::Empty)),
-        Plan::AlreadyPublished { watermark } => {
-            return Ok((table.clone(), Flushed::AlreadyPublished { watermark }))
-        }
-        Plan::Write { watermark } => watermark,
-    };
+/// This file is transport only — DuckDB reads it and writes the real lake file
+/// with its own layout. So the staging writer needs no bloom, no tuned row
+/// groups; it only needs correct types and column order.
+pub async fn stage(memtable: &Memtable, path: &Path) -> Result<()> {
+    let schema = schema::arrow_schema();
+    let file = tokio::fs::File::create(path).await?;
+    let mut writer = AsyncArrowWriter::try_new(file, schema, None)?;
 
-    let data_files = write_files(table, memtable, watermark, latency).await?;
-    let files = data_files.len();
-    let table = commit_files(table, catalog, data_files, watermark, latency).await?;
-
-    Ok((table, Flushed::Committed { watermark, files }))
+    for batch in batches(memtable) {
+        writer.write(&batch).await?;
+    }
+    writer.close().await?;
+    Ok(())
 }
 
-/// Commit written files, stamping the watermark into the snapshot summary.
-pub async fn commit_files(
-    table: &Table,
-    catalog: &RestCatalog,
-    data_files: Vec<iceberg::spec::DataFile>,
-    watermark: Lsn,
-    latency: LatencyProfile,
-) -> Result<Table> {
-    // Iceberg's own I/O (manifest, manifest list, table metadata) goes through
-    // opendal, which the latency shim cannot see. Charge it by hand so the flush
-    // duration — and the backpressure it drives — is not fiction. The counts are
-    // measured; see the constants.
-    charge(
-        latency,
-        COMMIT_CLIENT_PUTS + COMMIT_CATALOG_PUTS,
-        COMMIT_CLIENT_GETS + COMMIT_CATALOG_GETS,
-    )
-    .await;
-
-    let tx = Transaction::new(table);
-    let action = tx
-        .fast_append()
-        .add_data_files(data_files)
-        .set_snapshot_properties(HashMap::from([(
-            WATERMARK_PROP.to_string(),
-            watermark.to_string(),
-        )]))
-        // Deterministic, so a retry of an interrupted commit reuses the same
-        // manifest-list object name instead of leaking a fresh one. It does not
-        // make the commit idempotent — `plan` does that.
-        .set_commit_uuid(commit_uuid(watermark));
-
-    Ok(action.apply(tx)?.commit(catalog).await?)
-}
-
-/// Deterministic commit UUID for a given watermark.
-fn commit_uuid(watermark: Lsn) -> Uuid {
-    Uuid::new_v5(&COMMIT_NAMESPACE, &watermark.to_be_bytes())
-}
-
-/// Deterministic file-name prefix for a given watermark.
+/// Publish a staged file via the forked DuckDB binary.
 ///
-/// A flush that crashed after uploading its Parquet file but before committing
-/// leaves an orphan object. The retry writes to the *same* name and overwrites
-/// it, rather than leaking a new one and abandoning the old — and with neither
-/// compaction nor snapshot expiry in this prototype, nothing would ever clean
-/// that orphan up.
-fn file_prefix(watermark: Lsn) -> String {
-    format!("wm-{watermark:020}")
-}
-
-/// Write the memtable as one PK-sorted Parquet file. Does not publish it.
-pub async fn write_files(
-    table: &Table,
-    memtable: &Memtable,
-    watermark: Lsn,
+/// Shells out to the binary with a SQL script that attaches the catalog, points
+/// it at MinIO, and `INSERT … SELECT`s the staging rows. DuckDB writes the lake
+/// Parquet and all catalog rows in one transaction. Its S3 write goes through
+/// httpfs, which the latency shim cannot see, so charge it here for the
+/// backpressure number — one PUT, the same undercharge the write path always had.
+pub async fn publish(
+    duckdb: &DuckDbConfig,
+    catalog: &CatalogConfig,
+    s3: &S3Config,
+    staging: &Path,
     latency: LatencyProfile,
-) -> Result<Vec<iceberg::spec::DataFile>> {
-    let props = WriterProperties::builder()
-        .set_max_row_group_size(ROW_GROUP_ROWS)
-        .set_statistics_enabled(EnabledStatistics::Chunk)
-        .set_column_bloom_filter_enabled("pk".into(), true)
-        // Both of these must be set. Parquet's default NDV is a million, but a
-        // bloom filter is written per *column chunk* — that is, per row group,
-        // which holds ROW_GROUP_ROWS keys and not a million. Left at the default
-        // each filter is ~1 MiB, so the filters outweigh the data they index and
-        // a point read drags a megabyte off the object store to test one key.
-        .set_column_bloom_filter_ndv("pk".into(), ROW_GROUP_ROWS as u64)
-        .set_column_bloom_filter_fpp("pk".into(), BLOOM_FPP)
-        .build();
-
-    let schema = table.metadata().current_schema().clone();
-
-    let parquet_writer = ParquetWriterBuilder::new(props, schema);
-    let rolling = RollingFileWriterBuilder::new(
-        parquet_writer,
-        // One file per flush: the target size is set above what a memtable can
-        // hold, so the rolling writer never rolls. File-per-flush is what makes
-        // the watermark a property of the *file* and not just of the snapshot.
-        usize::MAX,
-        table.file_io().clone(),
-        DefaultLocationGenerator::new(table.metadata().clone())?,
-        DefaultFileNameGenerator::new(file_prefix(watermark), None, DataFileFormat::Parquet),
+) -> Result<()> {
+    let script = format!(
+        "{preamble}\
+         INSERT INTO lake.{schema}.{table} SELECT pk, lsn, op, value FROM read_parquet('{staging}');\n",
+        preamble = attach_preamble(catalog, s3),
+        schema = catalog.schema,
+        table = catalog.table,
+        staging = staging.display(),
     );
 
-    let mut writer = DataFileWriterBuilder::new(rolling).build(None).await?;
+    run_duckdb(duckdb, &script).await?;
+    charge(latency, 1, 0).await;
+    Ok(())
+}
 
-    // The memtable is already in PK order, so this is a scan, not a sort — the
-    // reason it is a skiplist and not a hash map.
-    for batch in batches(memtable) {
-        writer.write(batch).await?;
+/// The ATTACH + S3 settings every DuckDB script this engine runs begins with.
+/// Attaches the DuckLake catalog as `lake`, points httpfs at MinIO, and disables
+/// inlining (holy-grail is the row tier; the format's memtable must stay off).
+pub fn attach_preamble(catalog: &CatalogConfig, s3: &S3Config) -> String {
+    // MinIO endpoint without the scheme; the shim's config carries `http://`.
+    let endpoint = s3
+        .endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let use_ssl = s3.endpoint.starts_with("https://");
+
+    format!(
+        "ATTACH 'ducklake:postgres:{conn}' AS lake (DATA_PATH '{data}', DATA_INLINING_ROW_LIMIT 0);\n\
+         SET s3_endpoint='{endpoint}'; SET s3_access_key_id='{ak}'; SET s3_secret_access_key='{sk}';\n\
+         SET s3_url_style='path'; SET s3_use_ssl={ssl}; SET s3_region='{region}';\n\
+         SET httpfs_client_implementation='httplib';\n",
+        conn = catalog.pg_conn,
+        data = catalog.data_path,
+        ak = s3.access_key,
+        sk = s3.secret_key,
+        region = s3.region,
+        ssl = use_ssl,
+    )
+}
+
+/// Run a SQL script through the forked DuckDB binary, erroring on nonzero exit.
+pub async fn run_duckdb(duckdb: &DuckDbConfig, script: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = Command::new(&duckdb.binary)
+        .arg("-unsigned")
+        .arg(":memory:")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        stdin.write_all(script.as_bytes()).await?;
+        // Dropping stdin closes it, so DuckDB sees EOF and runs the script.
     }
-    let data_files = writer.close().await?;
 
-    // One PUT per data file, also written through opendal and so also unseen by
-    // the shim. A real 64 MiB upload would be multipart and cost more than one
-    // round trip; this undercharges the write path and is the next thing to fix
-    // if flush throughput ever becomes a headline number rather than a
-    // backpressure input.
-    charge(latency, data_files.len() as u32, 0).await;
-
-    Ok(data_files)
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        return Err(Error::DuckDbExec {
+            code: output.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Chunk the memtable into Arrow batches, in PK order.
@@ -329,21 +252,14 @@ fn finish(
 
     RecordBatch::try_new(
         Arc::clone(arrow_schema),
-        vec![
-            Arc::new(pk),
-            Arc::new(lsn),
-            Arc::new(op),
-            Arc::new(value),
-        ],
+        vec![Arc::new(pk), Arc::new(lsn), Arc::new(op), Arc::new(value)],
     )
     .expect("batch columns match the arrow schema")
 }
 
-/// Charge object-store round trips that the latency shim could not see.
-///
-/// Sequential, not concurrent: iceberg writes the manifest, then the manifest
-/// list, then commits, each depending on the last. Summing independent draws is
-/// what that dependency chain actually costs.
+/// Charge object-store round trips the latency shim could not see (DuckDB's
+/// httpfs write). Kept for the backpressure number; unlike the Iceberg version
+/// there are no fabricated metadata ops to charge — the catalog is Postgres.
 async fn charge(latency: LatencyProfile, puts: u32, gets: u32) {
     let total = latency.charge_for(puts, gets);
     if total.is_zero() {
@@ -360,18 +276,50 @@ mod tests {
     use bytes::Bytes;
 
     #[test]
-    fn commit_uuid_is_a_function_of_the_watermark() {
-        assert_eq!(commit_uuid(42), commit_uuid(42), "a retry must reuse it");
-        assert_ne!(commit_uuid(42), commit_uuid(43));
+    fn staging_path_is_a_function_of_the_watermark() {
+        let dir = Path::new("/tmp");
+        assert_eq!(staging_path(dir, 42), staging_path(dir, 42));
+        assert_ne!(staging_path(dir, 42), staging_path(dir, 43));
+        assert!(staging_path(dir, 42)
+            .to_string_lossy()
+            .ends_with("hg-stage-00000000000000000042.parquet"));
     }
 
     #[test]
-    fn file_prefix_is_a_function_of_the_watermark() {
-        assert_eq!(file_prefix(42), file_prefix(42));
-        assert_ne!(file_prefix(42), file_prefix(43));
-        // Zero-padded so the names sort in watermark order, which makes a
-        // bucket listing readable during a debugging session.
-        assert_eq!(file_prefix(42), "wm-00000000000000000042");
+    fn plan_skips_a_flush_already_covered_by_the_watermark() {
+        let mt = Memtable::new();
+        mt.insert(Record::put(Bytes::from_static(b"a"), 5, &b"one"[..]));
+        // published watermark 5 already covers max_lsn 5.
+        assert_eq!(plan(5, &mt), Plan::AlreadyPublished { watermark: 5 });
+        // published watermark 4 does not.
+        assert_eq!(plan(4, &mt), Plan::Write { watermark: 5 });
+    }
+
+    #[test]
+    fn plan_on_empty_memtable_is_empty() {
+        assert_eq!(plan(0, &Memtable::new()), Plan::Empty);
+    }
+
+    #[test]
+    fn attach_preamble_strips_the_endpoint_scheme_and_disables_inlining() {
+        let cat = CatalogConfig {
+            pg_conn: "host=127.0.0.1 dbname=holy_grail".into(),
+            schema: "main".into(),
+            table: "kv".into(),
+            data_path: "s3://warehouse/hg/".into(),
+        };
+        let s3 = S3Config {
+            endpoint: "http://localhost:9000".into(),
+            bucket: "warehouse".into(),
+            access_key: "admin".into(),
+            secret_key: "password".into(),
+            region: "us-east-1".into(),
+        };
+        let sql = attach_preamble(&cat, &s3);
+        assert!(sql.contains("s3_endpoint='localhost:9000'"));
+        assert!(sql.contains("s3_use_ssl=false"));
+        assert!(sql.contains("DATA_INLINING_ROW_LIMIT 0"));
+        assert!(sql.contains("ducklake:postgres:host=127.0.0.1 dbname=holy_grail"));
     }
 
     #[test]
@@ -386,20 +334,12 @@ mod tests {
         let b = &batches[0];
         assert_eq!(b.num_rows(), 3, "the tombstone is a row, not an omission");
 
-        let pk = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .unwrap();
+        let pk = b.column(0).as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert_eq!(pk.value(0), b"a");
         assert_eq!(pk.value(1), b"b");
         assert_eq!(pk.value(2), b"c");
 
-        let value = b
-            .column(3)
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .unwrap();
+        let value = b.column(3).as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert!(value.is_null(1), "the tombstone's value is null");
 
         let op = b.column(2).as_any().downcast_ref::<Int32Array>().unwrap();

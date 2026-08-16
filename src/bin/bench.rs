@@ -46,7 +46,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use holy_grail::config::Config;
-use holy_grail::Engine;
+use holy_grail::{catalog, Engine};
 
 /// Total keys written to the table.
 const KEYSPACE: u32 = 200_000;
@@ -119,6 +119,11 @@ async fn main() {
              Every number below will be a fiction. Re-run with HG_LATENCY=s3.\n"
         );
     }
+
+    // The engine is a read-only catalog client, so the table must exist first.
+    catalog::bootstrap(&cfg.duckdb, &cfg.catalog, &cfg.s3)
+        .await
+        .unwrap();
 
     let keys = write_table(&cfg, dist).await;
     let (working_set, hot) = calibrate(&cfg, &keys).await;

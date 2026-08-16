@@ -1,7 +1,7 @@
 //! The engine: write path, read path, flush, recovery.
 //!
 //! Recovery is the whole thesis in one function. `open` reads the watermark off
-//! the Iceberg table, replays the WAL suffix above it, and the node is back —
+//! the DuckLake catalog, replays the WAL suffix above it, and the node is back —
 //! with no local checkpoint file, no local record of what was flushed, nothing
 //! that would make local state authoritative. If `open` needed anything from
 //! disk beyond the WAL, the row tier would not be disposable and the claim would
@@ -11,15 +11,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use iceberg::table::Table;
-use iceberg_catalog_rest::RestCatalog;
 use object_store::ObjectStore;
 
 use crate::cache::{ByteCache, CacheStatsSnapshot, MetadataCache};
+use crate::catalog::DuckLake;
 use crate::config::Config;
 use crate::error::Result;
 use crate::flush::{self, Flushed, Plan};
-use crate::index::{published_watermark, FileIndex};
+use crate::index::FileIndex;
 use crate::memtable::{Lookup, MemtableSet};
 use crate::read::ColumnarReader;
 use crate::record::{Lsn, Record};
@@ -31,12 +30,12 @@ use crate::{catalog, Error};
 /// protocol that a real crash could land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrashAt {
-    /// After freezing the memtable, before any Parquet is written.
+    /// After freezing the memtable, before anything is staged.
     BeforeWrite,
-    /// After the Parquet file is in object storage, before the Iceberg commit.
-    /// Leaves an orphan object.
+    /// After the memtable is staged to a local Parquet file, before DuckDB
+    /// publishes it. Leaves an orphan staging file; nothing in the lake.
     AfterWrite,
-    /// After the commit is published, before the WAL is truncated. Leaves the
+    /// After DuckDB commits the snapshot, before the WAL is truncated. Leaves the
     /// WAL holding records that are already in the columnar level.
     AfterCommit,
     /// After truncation, before the memtable is retired.
@@ -45,14 +44,17 @@ pub enum CrashAt {
 
 pub struct Engine {
     cfg: Config,
-    catalog: RestCatalog,
 
-    table: RwLock<Table>,
+    lake: DuckLake,
     index: RwLock<Arc<FileIndex>>,
 
     memtables: Arc<MemtableSet>,
     wal: Arc<Mutex<Wal>>,
     next_lsn: AtomicU64,
+
+    /// Where flush stages local Parquet before DuckDB publishes it. Per-engine,
+    /// so concurrent engines in tests do not collide on the deterministic name.
+    staging_dir: std::path::PathBuf,
 
     store: Arc<LatencyStore>,
     cache: Arc<ByteCache>,
@@ -60,19 +62,18 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Open the engine, rebuilding all local state from `Iceberg + WAL`.
+    /// Open the engine, rebuilding all local state from `DuckLake + WAL`.
     pub async fn open(cfg: Config) -> Result<Self> {
         let store = store::build(&cfg.s3, cfg.latency)?;
-        let catalog = catalog::connect(&cfg.catalog, &cfg.s3).await?;
-        let table = catalog::ensure_table(&catalog, &cfg.catalog).await?;
+        let lake = catalog::DuckLake::connect(&cfg.catalog).await?;
 
         // The boundary between the columnar level and the WAL suffix. Read from
         // the catalog, which is the only thing authorised to know it.
-        let watermark = published_watermark(&table);
-        let index = FileIndex::load(&table).await?;
+        let watermark = lake.published_watermark().await?;
+        let index = FileIndex::load(&lake).await?;
 
         // Replay only what the columnar level does not already have. Records at
-        // or below the watermark are durable in Iceberg; replaying them would be
+        // or below the watermark are durable in DuckLake; replaying them would be
         // harmless but pointless.
         let (wal, replay) = Wal::open(&cfg.wal_dir, cfg.wal_segment_bytes, watermark)?;
 
@@ -89,11 +90,14 @@ impl Engine {
         // or a new write could reuse an LSN that a flushed file already claims.
         let next_lsn = replay.max_lsn.max(watermark) + 1;
 
+        let staging_dir = cfg.wal_dir.join("staging");
+        std::fs::create_dir_all(&staging_dir)?;
+
         let cache = ByteCache::new(cfg.cache_bytes as u64);
         let metadata = MetadataCache::new();
         let reader = ColumnarReader::new(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
-            cfg.s3.bucket.clone(),
+            lake.bucket.clone(),
             Arc::clone(&cache),
             metadata,
         );
@@ -108,12 +112,12 @@ impl Engine {
 
         Ok(Engine {
             cfg,
-            catalog,
-            table: RwLock::new(table),
+            lake,
             index: RwLock::new(Arc::new(index)),
             memtables,
             wal: Arc::new(Mutex::new(wal)),
             next_lsn: AtomicU64::new(next_lsn),
+            staging_dir,
             store,
             cache,
             reader,
@@ -176,9 +180,9 @@ impl Engine {
     /// Flush, optionally dying partway through.
     ///
     /// The crash points are the windows a real process death could land in. The
-    /// protocol's claim is that every one of them either loses something
-    /// reconstructible or duplicates something the watermark makes idempotent —
-    /// and that none of them can lose an acknowledged write.
+    /// protocol's claim is that every one either loses something reconstructible
+    /// or duplicates something the watermark makes idempotent — and that none of
+    /// them can lose an acknowledged write.
     pub async fn flush_inner(&self, crash: Option<CrashAt>) -> Result<Flushed> {
         let Some(frozen) = self.memtables.freeze()? else {
             return Ok(Flushed::Empty);
@@ -190,15 +194,15 @@ impl Engine {
             return Ok(Flushed::Empty);
         }
 
-        let table = self.table.read().unwrap().clone();
+        let published = self.lake.published_watermark().await?;
 
-        let watermark = match flush::plan(&table, &frozen) {
+        let watermark = match flush::plan(published, &frozen) {
             Plan::Empty => {
                 self.memtables.retire(&frozen);
                 return Ok(Flushed::Empty);
             }
-            // Already published: a retry after a crash between commit and
-            // truncate. Skip write and commit entirely, and go finish the job.
+            // Already published: a retry after a crash between publish and
+            // truncate. Skip staging and publishing, and go finish the job.
             Plan::AlreadyPublished { watermark } => {
                 self.truncate_wal(watermark).await?;
                 self.memtables.retire(&frozen);
@@ -207,28 +211,32 @@ impl Engine {
             Plan::Write { watermark } => watermark,
         };
 
-        let data_files = flush::write_files(&table, &frozen, watermark, self.cfg.latency).await?;
-        let files = data_files.len();
+        let staging = flush::staging_path(&self.staging_dir, watermark);
+        flush::stage(&frozen, &staging).await?;
 
-        // Crash here: an orphan Parquet object is left in the bucket. It is
-        // unreferenced garbage, not corruption, and the retry overwrites it —
-        // the file name is derived from the watermark.
+        // Crash here: an orphan local staging file is left. It is not in the
+        // lake, so nothing references it; the retry re-stages to the same name.
         if crash == Some(CrashAt::AfterWrite) {
             return Ok(Flushed::Empty);
         }
 
-        let table =
-            flush::commit_files(&table, &self.catalog, data_files, watermark, self.cfg.latency)
-                .await?;
+        flush::publish(
+            &self.cfg.duckdb,
+            &self.cfg.catalog,
+            &self.cfg.s3,
+            &staging,
+            self.cfg.latency,
+        )
+        .await?;
 
         // Published. From this instant the columnar level owns these records,
         // and the WAL copy is redundant rather than load-bearing.
-        self.publish(table).await?;
+        self.publish_index().await?;
 
-        // Crash here: the WAL still holds records that are already in Iceberg.
+        // Crash here: the WAL still holds records that are already in DuckLake.
         // Replay skips them (`lsn > watermark`) and the truncation is retried.
         if crash == Some(CrashAt::AfterCommit) {
-            return Ok(Flushed::Committed { watermark, files });
+            return Ok(Flushed::Committed { watermark, files: 1 });
         }
 
         self.truncate_wal(watermark).await?;
@@ -236,20 +244,20 @@ impl Engine {
         // Crash here: nothing is lost. The memtable is a cache of what is
         // already durable in the columnar level.
         if crash == Some(CrashAt::AfterTruncate) {
-            return Ok(Flushed::Committed { watermark, files });
+            return Ok(Flushed::Committed { watermark, files: 1 });
         }
 
         // Retire only now. Dropping the memtable any earlier would open a window
         // where acknowledged writes are in neither tier.
         self.memtables.retire(&frozen);
+        let _ = tokio::fs::remove_file(&staging).await;
 
-        Ok(Flushed::Committed { watermark, files })
+        Ok(Flushed::Committed { watermark, files: 1 })
     }
 
-    /// Swap in the post-commit table and rebuild the file index from it.
-    async fn publish(&self, table: Table) -> Result<()> {
-        let index = FileIndex::load(&table).await?;
-        *self.table.write().unwrap() = table;
+    /// Rebuild the file index from the catalog after a publish.
+    async fn publish_index(&self) -> Result<()> {
+        let index = FileIndex::load(&self.lake).await?;
         *self.index.write().unwrap() = Arc::new(index);
         Ok(())
     }
@@ -262,9 +270,10 @@ impl Engine {
         Ok(())
     }
 
-    /// The watermark currently published in the catalog.
+    /// The watermark currently published in the catalog, as reflected by the
+    /// in-memory index (rebuilt after every publish).
     pub fn watermark(&self) -> Lsn {
-        published_watermark(&self.table.read().unwrap())
+        self.index.read().unwrap().watermark()
     }
 
     pub fn file_count(&self) -> usize {

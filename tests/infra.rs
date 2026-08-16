@@ -1,8 +1,8 @@
-//! Step 1: MinIO + Iceberg REST catalog are real, and a PK-sorted Parquet file
-//! round-trips through the latency-wrapped object store.
+//! Step 1: MinIO + the DuckLake catalog (Postgres) are real, and a PK-sorted
+//! Parquet file round-trips through the latency-wrapped object store.
 //!
-//! Requires `docker compose up -d`. Ignored by default so `cargo test` stays
-//! hermetic; run with:
+//! Requires MinIO, Postgres, and the forked DuckDB binary to be up. Ignored by
+//! default so `cargo test` stays hermetic; run with:
 //!
 //!     cargo test --test infra -- --ignored --nocapture
 
@@ -11,7 +11,8 @@ use std::sync::Arc;
 use arrow::array::{Int32Array, Int64Array, LargeBinaryArray, RecordBatch};
 use bytes::Bytes;
 use holy_grail::config::Config;
-use holy_grail::schema::{self, FIELD_ID_PK};
+use holy_grail::index::FileIndex;
+use holy_grail::schema;
 use holy_grail::store::{self, LatencyProfile};
 use holy_grail::{catalog, Op};
 use object_store::path::Path;
@@ -71,32 +72,25 @@ fn write_parquet(batch: &RecordBatch) -> Bytes {
 }
 
 #[tokio::test]
-#[ignore = "requires docker compose up -d"]
-async fn catalog_creates_the_table_and_is_idempotent() {
-    let cfg = Config::from_env();
-    let cat = catalog::connect(&cfg.catalog, &cfg.s3).await.unwrap();
+#[ignore = "requires the DuckLake catalog, MinIO, and the forked duckdb binary"]
+async fn catalog_bootstrap_is_idempotent_and_resolves() {
+    let mut cfg = Config::from_env();
+    cfg.catalog.table = format!("t_infra_{}", std::process::id());
 
-    let table = catalog::ensure_table(&cat, &cfg.catalog).await.unwrap();
-    let again = catalog::ensure_table(&cat, &cfg.catalog).await.unwrap();
-    assert_eq!(
-        table.metadata().uuid(),
-        again.metadata().uuid(),
-        "ensure_table must load, not recreate — recovery depends on it"
-    );
+    // Bootstrap is the DDL the engine relies on but never issues. It must be
+    // idempotent — a second run loads rather than recreates, which recovery
+    // depends on.
+    catalog::bootstrap(&cfg.duckdb, &cfg.catalog, &cfg.s3).await.unwrap();
+    catalog::bootstrap(&cfg.duckdb, &cfg.catalog, &cfg.s3).await.unwrap();
 
-    let schema = table.metadata().current_schema();
-    assert_eq!(
-        schema.identifier_field_ids().collect::<Vec<_>>(),
-        vec![FIELD_ID_PK]
-    );
+    // Connect resolves the table and verifies the column mapping (a mismatch
+    // there would produce all-null reads).
+    let lake = catalog::DuckLake::connect(&cfg.catalog).await.unwrap();
 
-    let order = table.metadata().default_sort_order();
-    assert_eq!(order.fields.len(), 1, "table must be sorted by pk");
-    assert_eq!(order.fields[0].source_id, FIELD_ID_PK);
-
-    // No data yet, so no snapshot, so no watermark. A recovering node here must
-    // replay the WAL from 0.
-    assert!(table.metadata().current_snapshot().is_none() || table.metadata().snapshots().count() > 0);
+    // No data yet, so no files, so watermark 0. A recovering node here replays
+    // the WAL from 0.
+    assert_eq!(lake.published_watermark().await.unwrap(), 0);
+    assert!(FileIndex::load(&lake).await.unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -86,6 +86,14 @@ The reasoning behind it ("1× is the most favourable case, so a blown tail there
 
 The sweep now runs 0.5× → 32×.
 
+## Status — 2026-07-25
+
+The durable store has moved from Iceberg to **DuckLake** (Parquet on MinIO, catalog rows in Postgres, published by a forked DuckDB binary). The full rationale and the entries it supersedes are in [DECISIONS.md](DECISIONS.md), "Migration: Iceberg → DuckLake". Everything below this banner is Iceberg-era framing kept as history — the build order and the two claims still hold, only the store changed.
+
+- **Steps 0–7 done under DuckLake.** 48 unit + 13 integration tests green; the four flush crash windows converge; an external forked-DuckDB reads back rows this engine wrote (the table is genuine DuckLake, not DuckLake-shaped).
+- **The opendal hole is closed structurally** (see the resolved open issue at the bottom of this file): DuckLake keeps no metadata on object storage, so there is nothing to hand-charge.
+- **R1's proposed bloom-pinning fix was superseded by catalog blooms.** The forked extension writes an opt-in `pk` bloom into the catalog; the read path probes it in memory. [RESULTS.md](RESULTS.md) R2 measured the result: p99 3–5× better than R1 past the knee, and the runaway cliff becomes a bounded plateau. The ratio-1 knee (cache = data working set) is unchanged; compaction remains the next lever.
+
 ## Status — 2026-07-14
 
 Steps 0–6 are done. 37 unit tests and 13 integration tests pass; the build is clean, with no warnings.
@@ -126,7 +134,13 @@ Two things the implementation forced, both recorded below: the `object_store` ve
 
 The three versions are not free choices. `iceberg` 0.8 builds against arrow/parquet 57, and parquet 57 against object_store 0.12. Taking newer versions of any of them puts *two* copies of that crate in the tree as distinct types — so an arrow `RecordBatch` cannot be handed to iceberg's writer, and our latency-wrapped `ObjectStore` cannot be handed to the Parquet reader at all. The shim would be bypassed precisely where it matters most. Iceberg's pins win.
 
-## Open issue: the latency shim has a hole in it
+## Resolved: the latency shim's hole (closed by the DuckLake migration, 2026-07-25)
+
+The option that won was not on the list below: **change the format so there is no metadata I/O.** DuckLake keeps snapshots, the file list, stats and blooms as Postgres rows, and puts only data Parquet on object storage. So every object-store read on the point-read path is a data-file read, which the shim sees in full — there is no uncharged metadata traffic left to account for, and the hand-charged commit constants are deleted. The original analysis is kept below because the reasoning is *why* the migration was worth doing.
+
+---
+
+## Open issue (Iceberg-era, now resolved above): the latency shim has a hole in it
 
 `iceberg` does its own I/O through **opendal**, not through `object_store`. Our latency shim wraps `object_store`, so:
 

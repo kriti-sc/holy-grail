@@ -8,8 +8,14 @@ pub enum Error {
     #[error("object store: {0}")]
     ObjectStore(#[from] object_store::Error),
 
-    #[error("iceberg: {0}")]
-    Iceberg(#[from] iceberg::Error),
+    #[error("postgres: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+
+    /// A shell-out to the forked DuckDB binary failed. This is the "write the
+    /// table" library reporting an error — the DuckLake analog of a failed
+    /// Iceberg commit.
+    #[error("duckdb publish failed (exit {code}): {stderr}")]
+    DuckDbExec { code: i32, stderr: String },
 
     #[error("parquet: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),

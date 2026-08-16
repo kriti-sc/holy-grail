@@ -19,6 +19,7 @@ pub struct Config {
 
     pub s3: S3Config,
     pub catalog: CatalogConfig,
+    pub duckdb: DuckDbConfig,
     pub latency: LatencyProfile,
 
     /// Bytes of Parquet held locally. The variable swept in the benchmark: it is
@@ -35,12 +36,39 @@ pub struct S3Config {
     pub region: String,
 }
 
+/// The DuckLake catalog: a Postgres database plus the schema/table the engine
+/// reads. Unlike the Iceberg REST catalog this replaced, holy-grail only ever
+/// *reads* here — the forked DuckDB binary is what writes catalog rows.
 #[derive(Debug, Clone)]
 pub struct CatalogConfig {
-    pub uri: String,
-    pub warehouse: String,
-    pub namespace: String,
+    /// libpq-style connection string, e.g.
+    /// `host=127.0.0.1 dbname=holy_grail user=admin`.
+    pub pg_conn: String,
+    /// DuckLake schema name (`main` by default).
+    pub schema: String,
+    /// Table name (`kv`).
     pub table: String,
+    /// The `DATA_PATH` the catalog was attached with, e.g.
+    /// `s3://warehouse/hg/`. File paths in `ducklake_data_file` are relative to
+    /// this (plus the schema/table subpaths).
+    pub data_path: String,
+}
+
+/// How to drive the forked DuckDB binary that publishes flushes. This is the
+/// DuckLake "write the table" library — the analog of the iceberg crate.
+#[derive(Debug, Clone)]
+pub struct DuckDbConfig {
+    /// Path to the forked `duckdb` binary (built with httpfs + postgres, and the
+    /// catalog-bloom modification).
+    pub binary: PathBuf,
+    /// Rows per Parquet row group DuckDB writes. Must match the read path's
+    /// assumption — the default (a million) would put the file in one row group
+    /// and make row-group pruning a no-op.
+    pub row_group_size: usize,
+    /// Whether to opt the table into catalog-side bloom filters on `pk`. Off in
+    /// Phase 1 (the read path still probes the Parquet on-disk bloom, so the R1
+    /// curve stays a byte-identical control); on in Phase 2.
+    pub catalog_blooms: bool,
 }
 
 impl Default for Config {
@@ -52,6 +80,7 @@ impl Default for Config {
             max_frozen_memtables: 2,
             s3: S3Config::default(),
             catalog: CatalogConfig::default(),
+            duckdb: DuckDbConfig::default(),
             latency: LatencyProfile::none(),
             cache_bytes: 256 * 1024 * 1024,
         }
@@ -73,10 +102,29 @@ impl Default for S3Config {
 impl Default for CatalogConfig {
     fn default() -> Self {
         CatalogConfig {
-            uri: env("HG_CATALOG_URI", "http://localhost:8181"),
-            warehouse: env("HG_WAREHOUSE", "s3://warehouse/"),
-            namespace: env("HG_NAMESPACE", "holy_grail"),
+            pg_conn: env(
+                "HG_PG_CONN",
+                "host=127.0.0.1 dbname=holy_grail",
+            ),
+            schema: env("HG_SCHEMA", "main"),
             table: env("HG_TABLE", "kv"),
+            data_path: env("HG_DATA_PATH", "s3://warehouse/hg/"),
+        }
+    }
+}
+
+impl Default for DuckDbConfig {
+    fn default() -> Self {
+        DuckDbConfig {
+            binary: PathBuf::from(env(
+                "HG_DUCKDB_BIN",
+                "/Users/kriti/Projects/ducklake/build/release/duckdb",
+            )),
+            row_group_size: 8192,
+            // On: the catalog bloom on `pk` is the *only* pk bloom DuckLake
+            // writes (DuckDB does not emit an on-disk Parquet bloom for a
+            // high-cardinality key), and the read path probes it in memory.
+            catalog_blooms: true,
         }
     }
 }

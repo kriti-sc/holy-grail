@@ -96,10 +96,11 @@ async fn crash_after_write_leaves_an_orphan_and_retries_cleanly() {
 /// watermark, and the retried flush sees its watermark is already published and
 /// declines to write a second snapshot.
 ///
-/// This is exactly the case where relying on iceberg's commit UUID for
-/// idempotency would silently produce duplicate rows.
+/// This is exactly the case where a naive re-publish would silently produce
+/// duplicate rows: DuckDB's INSERT is not idempotent on its own, so the watermark
+/// check — not the write mechanism — is what makes the retry safe.
 #[tokio::test]
-#[ignore = "requires docker compose up -d"]
+#[ignore = "requires the DuckLake catalog, MinIO, and the forked duckdb binary"]
 async fn crash_after_commit_does_not_duplicate_on_recovery() {
     let fx = Fixture::new("crash_after_commit");
 

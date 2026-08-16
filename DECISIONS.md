@@ -8,7 +8,31 @@ Status of each step is tracked in [PLAN.md](PLAN.md). The architecture and the t
 
 ## Cross-cutting
 
-### The row tier is a cache; Iceberg is the store
+### Migration: Iceberg → DuckLake (2026-07-25)
+
+The durable store moved from Iceberg to **DuckLake**: Parquet on object storage, but all metadata (snapshots, file list, column stats, blooms) as rows in **Postgres** rather than Avro manifests + `metadata.json` on S3. The reasoning below supersedes several Iceberg-era entries further down; those are kept as history, not current truth. Read this first.
+
+**Why it was worth doing — the opendal hole closes structurally.** Iceberg does its metadata I/O through opendal, which the latency shim (over `object_store`) cannot see, so the flush path *hand-charged* a measured 9-op fudge (`COMMIT_*` constants). DuckLake keeps **zero metadata on object storage** — verified: after a full run the bucket holds only `.parquet`, and 53 snapshots / 31 data files / 124 column stats live in Postgres. So there is nothing to hand-charge: the read path's object-store traffic is *all* data-file traffic, which the shim sees in full. The deferred "known hole" is not patched, it is gone.
+
+**DuckDB writes the table; holy-grail orchestrates.** DuckLake has no Rust writer library, so the forked DuckDB binary plays the role the iceberg crate played — the "write the table" primitive, called at the *publish* step. Flush stages the frozen memtable to a local Parquet file, then shells out (`INSERT … SELECT read_parquet(...)`); DuckDB writes the real data file to S3 and all catalog rows in one transaction. The thesis (claim #2, the rebuildable row tier) stays holy-grail's because it lives in the *orchestration* — WAL, freeze, watermark, truncate, recovery — not in the metadata-write mechanics, which were already outsourced under Iceberg. This is why "outsourcing the write to DuckDB" does not outsource the contribution. holy-grail is a **read-only** catalog client; the table's DDL is `catalog::bootstrap`'s shell-out, never the engine's.
+
+- **The engine still owns the read path**, so R1's measurement premise holds: DuckDB's write I/O is invisible to the shim, but that is the *write* side (secondary, backpressure only) and was already hand-charged under Iceberg. Reads are 100% holy-grail's Rust through the shim.
+
+**The watermark is derived, not stored.** DuckLake has no per-snapshot summary property. Instead of a side row, the watermark is `MAX(lsn)` over live files, read from `ducklake_file_column_stats` — which DuckDB commits *atomically with the data file*. So it cannot be out of step with the data it describes (it is a stat *of* that data), and there is no second write to lose in a crash window. Supersedes "The watermark lives in the snapshot summary".
+
+**The version pins are now a choice, not a cage.** Iceberg 0.8 forced arrow/parquet 57 + object_store 0.12 (distinct-type incompatibilities otherwise). With iceberg gone, nothing forces them; 57 is kept only to hold the diff down. Supersedes "Versions are dictated by iceberg".
+
+**`Binary` is arrow `Binary` again, not `LargeBinary`.** Iceberg mapped its `Binary` to arrow `LargeBinary`; DuckDB writes BLOB as plain `BYTE_ARRAY` with no logical type, which the reader maps to `BinaryArray` (32-bit offsets). The read path downcasts to `BinaryArray` now. The staging file we hand DuckDB is still `LargeBinary`, but DuckDB rewrites the lake file with its own encoding — and that is the file reads see. Different mapping, same class of silent-all-null footgun; the field-id assertion in `catalog.rs` guards it against the live `ducklake_column`.
+
+**The pk bloom is a *catalog* bloom, and the read path probes it in memory.** This is the biggest read-path change and it supersedes R1's proposed cache-pinning fix (see RESULTS.md R2). DuckDB does **not** write an on-disk Parquet bloom for a high-cardinality `pk` (no dictionary encoding → no bloom), so there is no on-disk bloom to reuse. The forked extension instead writes an opt-in bloom per file into `ducklake_file_column_blooms` — an SBBF hashed with `DuckLakeMurmur3`, stored Base64. The read path loads these into the in-memory file index (one Postgres read at index-build, in the same query as the stats) and probes them in-process (`bloom.rs`, ported from the fork and pinned by a test against a real blob the extension wrote). Consequence: **dismissing a file costs zero object-store I/O and zero cache bytes** — strictly better than both Iceberg's on-disk bloom (an S3 fetch per file) *and* R1's pin-in-cache idea (which still spends cache bytes). R2 measured the payoff: p99 3–5× lower past the knee, and the runaway cliff becomes a bounded plateau.
+
+- **Idempotency is unchanged in spirit.** DuckDB's INSERT is not idempotent on its own — a retried publish appends a second file. The watermark check in `flush::plan` (compare memtable max-LSN to the published derived watermark) is still the mechanism, now against an atomic INSERT rather than an Iceberg commit. The four crash windows are identical; `AfterWrite` now means "staged locally, not yet published".
+
+- **`DATA_INLINING_ROW_LIMIT = 0` is required, not tuning.** DuckLake ships its own memtable (inlining small writes as catalog rows). holy-grail *is* the row tier, so inlining must be off or small flushes land as catalog rows the Parquet read path cannot see.
+
+---
+
+### The row tier is a cache; the lakehouse is the store
 
 Not "an LSM tree that happens to persist into Iceberg." The columnar table already holds the full historical evolution of the row data (it is fed by CDC), so the OLTP engine is a *derived, disposable serving layer* over it. `Iceberg + WAL suffix` is the complete truth.
 

@@ -8,13 +8,16 @@
 //! count only grows, so pruning is not an optimisation, it is what makes the
 //! read path viable at all:
 //!
-//! 1. **Interval prune** — the PK bounds are already in the file index, in
-//!    memory, so skipping a file costs nothing.
-//! 2. **Row-group prune** — PK min/max per row group, from the footer.
-//! 3. **Bloom filter** — one cached range read, and the file is dismissed.
+//! 1. **Interval prune** — the PK bounds are in the file index, in memory, so
+//!    skipping a file costs nothing.
+//! 2. **Catalog bloom** — the pk bloom, loaded from Postgres into the index and
+//!    probed in memory (see `bloom.rs`). A file the bloom rules out is dismissed
+//!    with **no object-store I/O at all** — not even a footer read. Under Iceberg
+//!    this step was a per-file S3 fetch; sourcing the bloom from the catalog is
+//!    what makes it free.
+//! 3. **Row-group prune** — PK min/max per row group, from the footer.
 //! 4. Only then fetch the surviving row group's column chunks.
 
-use std::io::Cursor;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -23,13 +26,9 @@ use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::ProjectionMask;
-use parquet::bloom_filter::Sbbf;
-use parquet::data_type::ByteArray;
-use parquet::errors::Result as ParquetResult;
 use parquet::file::metadata::ColumnChunkMetaData;
-use parquet::file::reader::{ChunkReader, Length};
 
-use arrow::array::{Array, Int32Array, LargeBinaryArray};
+use arrow::array::{Array, BinaryArray, Int32Array};
 
 use crate::cache::{ByteCache, CachedReader, MetadataCache};
 use crate::error::Result;
@@ -65,6 +64,13 @@ impl ColumnarReader {
     /// Look `key` up in the columnar level.
     pub async fn get(&self, index: &FileIndex, key: &[u8]) -> Result<Lookup> {
         for entry in index.candidates(key) {
+            // Free in-memory dismissal: the pk catalog bloom (loaded into the
+            // index from Postgres, not fetched per read) rules a file out with no
+            // object-store I/O at all — not even a footer read. This is the whole
+            // point of catalog-sourced blooms: a missed file costs zero GETs.
+            if !entry.bloom_may_contain(key) {
+                continue;
+            }
             match self.get_from_file(entry, key).await? {
                 Lookup::Missing => continue,
                 // Found or Deleted: this is the newest file that has an opinion
@@ -93,9 +99,6 @@ impl ColumnarReader {
             if !row_group_may_contain(column, key) {
                 continue;
             }
-            if !self.bloom_may_contain(&reader, column, key).await? {
-                continue;
-            }
 
             // The file is PK-sorted with unique keys, so at most one row group
             // can hold it. Whatever this row group says is final for this file.
@@ -103,32 +106,6 @@ impl ColumnarReader {
         }
 
         Ok(Lookup::Missing)
-    }
-
-    /// PK min/max for the row group, straight out of the footer.
-    async fn bloom_may_contain(
-        &self,
-        reader: &CachedReader,
-        column: &ColumnChunkMetaData,
-        key: &[u8],
-    ) -> Result<bool> {
-        let (Some(offset), Some(length)) = (column.bloom_filter_offset(), column.bloom_filter_length())
-        else {
-            // No bloom filter: cannot rule the file out, so scan it. Correct,
-            // just slower. Files this engine writes always have one.
-            return Ok(true);
-        };
-
-        let offset = offset as u64;
-        let bytes = reader.fetch(offset..offset + length as u64).await?;
-
-        let chunk = OffsetChunkReader { base: offset, bytes };
-        match Sbbf::read_from_column_chunk(column, &chunk)? {
-            // The writer hashed the pk column's physical BYTE_ARRAY values, so
-            // the probe has to hash the same bytes the same way.
-            Some(sbbf) => Ok(sbbf.check(&ByteArray::from(key.to_vec()))),
-            None => Ok(true),
-        }
     }
 
     async fn scan_row_group(
@@ -180,11 +157,16 @@ impl ColumnarReader {
     }
 }
 
-fn binary_col(batch: &arrow::array::RecordBatch, idx: usize) -> &LargeBinaryArray {
+// DuckDB writes BLOB columns as plain Parquet BYTE_ARRAY with no logical type,
+// which the arrow reader maps to `BinaryArray` (32-bit offsets) — not the
+// `LargeBinaryArray` iceberg's Binary→LargeBinary mapping used to produce. The
+// staging file we hand DuckDB is LargeBinary, but DuckDB rewrites the lake file
+// with its own encoding, and this is the file the read path actually sees.
+fn binary_col(batch: &arrow::array::RecordBatch, idx: usize) -> &BinaryArray {
     batch
         .column(idx)
         .as_any()
-        .downcast_ref::<LargeBinaryArray>()
+        .downcast_ref::<BinaryArray>()
         .expect("pk and value are binary")
 }
 
@@ -198,50 +180,3 @@ fn row_group_may_contain(column: &ColumnChunkMetaData, key: &[u8]) -> bool {
     key >= min && key <= max
 }
 
-/// A `ChunkReader` over a slice of a file, with absolute offsets.
-///
-/// `Sbbf::read_from_column_chunk` addresses the file absolutely, but we only
-/// fetch the bloom filter's own byte range — fetching the whole file to read a
-/// filter designed to save us from reading the file would be a poor trade. This
-/// shifts the offsets back.
-struct OffsetChunkReader {
-    base: u64,
-    bytes: Bytes,
-}
-
-impl Length for OffsetChunkReader {
-    fn len(&self) -> u64 {
-        self.base + self.bytes.len() as u64
-    }
-}
-
-impl ChunkReader for OffsetChunkReader {
-    type T = Cursor<Bytes>;
-
-    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
-        let offset = (start - self.base) as usize;
-        Ok(Cursor::new(self.bytes.slice(offset..)))
-    }
-
-    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
-        let offset = (start - self.base) as usize;
-        Ok(self.bytes.slice(offset..offset + length))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn offset_chunk_reader_addresses_the_file_not_the_slice() {
-        let chunk = OffsetChunkReader {
-            base: 1000,
-            bytes: Bytes::from_static(b"abcdef"),
-        };
-
-        assert_eq!(chunk.len(), 1006);
-        assert_eq!(&chunk.get_bytes(1000, 3).unwrap()[..], b"abc");
-        assert_eq!(&chunk.get_bytes(1003, 3).unwrap()[..], b"def");
-    }
-}

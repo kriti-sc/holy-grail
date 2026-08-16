@@ -1,13 +1,14 @@
-//! A key-value engine whose durable bottom level is an Iceberg table on object
-//! storage.
+//! A key-value engine whose durable bottom level is a DuckLake table — Parquet
+//! on object storage, catalog rows in Postgres.
 //!
 //! The row tier — memtable, WAL, cache — is a disposable acceleration layer over
-//! that table. `Iceberg + WAL suffix` is the complete source of truth; every
+//! that table. `DuckLake + WAL suffix` is the complete source of truth; every
 //! other piece of local state can be thrown away and rebuilt.
 //!
 //! See PLAN.md for the build order and the two claims this prototype exists to
 //! turn into numbers.
 
+pub mod bloom;
 pub mod cache;
 pub mod catalog;
 pub mod config;

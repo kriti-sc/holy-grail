@@ -4,54 +4,65 @@
 //! PK bounds. Sorted by watermark, newest first — which is the order a point
 //! read walks, taking the first hit.
 //!
-//! Two things fall out of building this once and holding it in memory:
+//! Under DuckLake this is **one SQL query** against Postgres, not a walk of Avro
+//! manifests on S3. The PK bounds and the per-file `lsn` max are columns in
+//! `ducklake_file_column_stats`, so the interval map and the watermark both fall
+//! out of the same read — no object-store I/O at all.
 //!
-//! * **The interval map is free.** PK lower and upper bounds are already in the
-//!   Iceberg manifest, so pruning a file by key range costs no I/O at all.
-//! * **It plugs the opendal hole.** Iceberg does its manifest I/O through
-//!   opendal, which our latency shim cannot see, so those reads pay no injected
-//!   latency. Doing them once at startup rather than once per point read is both
-//!   what a real system does and what keeps the benchmark honest — a per-read
-//!   manifest fetch that costs nothing would be a lie about the read path.
-//!
-//! Precondition: this index is only ever rebuilt after *our own* commits
+//! Precondition: this index is only rebuilt after *our own* flushes
 //! (`Engine::publish`). Nothing polls the catalog, so it is sound only while this
-//! process is the table's sole writer — which today it is. A second writer, or
-//! compaction, makes a freshness check on the read path mandatory rather than
-//! optional. See DECISIONS.md, "The cached index is sound only because this
-//! process is the sole writer".
-
-use std::collections::HashMap;
+//! process is the table's sole writer — which today it is. A second writer makes
+//! a freshness check on the read path mandatory; under DuckLake that check is
+//! cheap (compare against `MAX(snapshot_id)`), but it is still not free and not
+//! built. See DECISIONS.md, "The cached index is sound only because this process
+//! is the sole writer".
 
 use bytes::Bytes;
-use iceberg::spec::{DataContentType, ManifestStatus};
-use iceberg::table::Table;
 use object_store::path::Path;
 
-use crate::error::Result;
+use crate::bloom::CatalogBloom;
+use crate::catalog::DuckLake;
+use crate::error::{Error, Result};
 use crate::record::Lsn;
-use crate::schema::{FIELD_ID_PK, WATERMARK_PROP};
+use crate::schema::{FIELD_ID_LSN, FIELD_ID_PK};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
-    /// Iceberg's full location, e.g. `s3://warehouse/holy_grail/kv/data/x.parquet`.
+    /// Object key within the bucket, e.g. `hg/main/kv/ducklake-….parquet`.
+    /// Already resolved from DATA_PATH + schema + table + relative path.
     pub location: String,
-    /// Highest LSN this file covers. Total order across files — this is what
-    /// makes newest-first, first-hit-wins correct without a per-row merge.
+    /// Highest LSN this file covers — the `lsn` column's max stat. Total order
+    /// across files, which is what makes newest-first, first-hit-wins correct
+    /// without a per-row merge.
     pub watermark: Lsn,
     pub pk_min: Bytes,
     pub pk_max: Bytes,
     pub file_size: u64,
     pub record_count: u64,
+    /// The `pk` catalog bloom for this file, parsed from
+    /// `ducklake_file_column_blooms`. `None` if the file has no bloom (an older
+    /// file, or blooms disabled) — the read path then cannot prune by bloom and
+    /// falls back to opening the file, which is safe, only slower.
+    pub bloom: Option<CatalogBloom>,
 }
 
 impl FileEntry {
-    /// Could this file contain `key`? Answered from the manifest bounds alone.
+    /// Could this file contain `key`? Answered from the catalog bounds alone.
     pub fn may_contain(&self, key: &[u8]) -> bool {
         key >= &self.pk_min[..] && key <= &self.pk_max[..]
     }
 
-    /// Path within the bucket, for the object store.
+    /// Might this file contain `key`, per its bloom? A `None` bloom cannot rule
+    /// the key out, so it answers "maybe". Answered entirely in memory — no
+    /// object-store or catalog I/O, which is why file dismissal here is free.
+    pub fn bloom_may_contain(&self, key: &[u8]) -> bool {
+        self.bloom.as_ref().map_or(true, |b| b.might_contain(key))
+    }
+
+    /// Path within the bucket, for the object store. `location` is already the
+    /// bucket-relative key, so this is a straight conversion; the `bucket`
+    /// argument is accepted for call-site compatibility and, when a full
+    /// `s3://bucket/...` location sneaks in, stripped.
     pub fn object_path(&self, bucket: &str) -> Path {
         let prefix = format!("s3://{bucket}/");
         let rel = self
@@ -74,70 +85,64 @@ impl FileIndex {
         FileIndex::default()
     }
 
-    /// Read the whole index out of the table's current snapshot.
+    /// Build the index from the catalog in one query.
     ///
-    /// Walks the current manifest list — which references every live manifest,
-    /// not just this snapshot's — and attributes each manifest's data files to
-    /// the snapshot that added it, and so to that snapshot's watermark.
-    pub async fn load(table: &Table) -> Result<Self> {
-        let metadata = table.metadata();
-        let file_io = table.file_io();
+    /// Joins `ducklake_data_file` to its `pk` and `lsn` column stats, keeping
+    /// only live files (`end_snapshot IS NULL`). PK bounds come back hex-encoded
+    /// (DuckLake's encoding for BLOB min/max); `lsn` max comes back as a decimal
+    /// string.
+    pub async fn load(lake: &DuckLake) -> Result<Self> {
+        // LEFT JOIN the pk bloom: it is the only pk bloom DuckLake writes, and
+        // pulling it here (once per index build, in the same round trip as the
+        // stats) is what makes the read path's file dismissal a free in-memory
+        // probe rather than a per-file object-store fetch.
+        let rows = lake
+            .client()
+            .query(
+                "SELECT f.path, f.file_size_bytes, f.record_count, \
+                        pk.min_value, pk.max_value, lsn.max_value, b.bloom \
+                 FROM ducklake_data_file f \
+                 JOIN ducklake_file_column_stats pk \
+                   ON pk.data_file_id = f.data_file_id AND pk.column_id = $2 \
+                 JOIN ducklake_file_column_stats lsn \
+                   ON lsn.data_file_id = f.data_file_id AND lsn.column_id = $3 \
+                 LEFT JOIN ducklake_file_column_blooms b \
+                   ON b.data_file_id = f.data_file_id AND b.column_id = $2 \
+                 WHERE f.table_id = $1 AND f.end_snapshot IS NULL",
+                &[
+                    &lake.table_id,
+                    &(FIELD_ID_PK as i64),
+                    &(FIELD_ID_LSN as i64),
+                ],
+            )
+            .await?;
 
-        let Some(current) = metadata.current_snapshot() else {
-            // No snapshot means nothing has ever been flushed. Everything lives
-            // in the WAL, and a recovering node replays from LSN 0.
-            return Ok(FileIndex::empty());
-        };
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let path: String = row.get(0);
+            let file_size: i64 = row.get(1);
+            let record_count: i64 = row.get(2);
+            let pk_min_hex: String = row.get(3);
+            let pk_max_hex: String = row.get(4);
+            let lsn_max_str: String = row.get(5);
+            let bloom_b64: Option<String> = row.get(6);
 
-        // snapshot id -> the watermark that snapshot published.
-        let watermarks: HashMap<i64, Lsn> = metadata
-            .snapshots()
-            .map(|s| (s.snapshot_id(), watermark_of(s.as_ref())))
-            .collect();
+            let pk_min = decode_hex(&pk_min_hex, "pk min")?;
+            let pk_max = decode_hex(&pk_max_hex, "pk max")?;
+            let watermark: Lsn = lsn_max_str.parse().map_err(|_| {
+                Error::Config(format!("lsn max stat is not an integer: {lsn_max_str:?}"))
+            })?;
+            let bloom = bloom_b64.as_deref().and_then(CatalogBloom::from_base64);
 
-        let manifest_list = current.load_manifest_list(file_io, metadata).await?;
-        let mut entries = Vec::new();
-
-        for manifest_file in manifest_list.entries() {
-            let watermark = watermarks
-                .get(&manifest_file.added_snapshot_id)
-                .copied()
-                .unwrap_or(0);
-
-            let manifest = manifest_file.load_manifest(file_io).await?;
-
-            for entry in manifest.entries() {
-                if entry.status() == ManifestStatus::Deleted {
-                    continue;
-                }
-                let data_file = entry.data_file();
-                if data_file.content_type() != DataContentType::Data {
-                    continue;
-                }
-
-                let (Some(pk_min), Some(pk_max)) = (
-                    bound_bytes(data_file.lower_bounds()),
-                    bound_bytes(data_file.upper_bounds()),
-                ) else {
-                    // A file with no PK bounds cannot be pruned, and silently
-                    // scanning it on every read would quietly destroy the point
-                    // of the interval map. Nothing this engine writes can hit
-                    // this — the writer always emits bounds.
-                    return Err(crate::Error::Config(format!(
-                        "data file {} has no pk bounds; the interval map cannot prune it",
-                        data_file.file_path()
-                    )));
-                };
-
-                entries.push(FileEntry {
-                    location: data_file.file_path().to_string(),
-                    watermark,
-                    pk_min,
-                    pk_max,
-                    file_size: data_file.file_size_in_bytes(),
-                    record_count: data_file.record_count(),
-                });
-            }
+            entries.push(FileEntry {
+                location: format!("{}{}", lake.key_prefix, path),
+                watermark,
+                pk_min,
+                pk_max,
+                file_size: file_size as u64,
+                record_count: record_count as u64,
+                bloom,
+            });
         }
 
         // Newest first. Watermarks are monotonic, so this is a total order and
@@ -171,34 +176,10 @@ impl FileIndex {
     }
 }
 
-/// The watermark a snapshot published, or 0 if it carries none (a snapshot this
-/// engine did not write).
-pub fn watermark_of(snapshot: &iceberg::spec::Snapshot) -> Lsn {
-    snapshot
-        .summary()
-        .additional_properties
-        .get(WATERMARK_PROP)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
-}
-
-/// Read the published watermark straight off the table.
-///
-/// This is the number recovery turns on: WAL records at or below it are already
-/// in the columnar level, and a flush that would publish at or below it has
-/// already landed.
-pub fn published_watermark(table: &Table) -> Lsn {
-    table
-        .metadata()
-        .current_snapshot()
-        .map(|s| watermark_of(s.as_ref()))
-        .unwrap_or(0)
-}
-
-fn bound_bytes(bounds: &HashMap<i32, iceberg::spec::Datum>) -> Option<Bytes> {
-    let datum = bounds.get(&FIELD_ID_PK)?;
-    let buf = datum.to_bytes().ok()?;
-    Some(Bytes::from(buf.to_vec()))
+fn decode_hex(s: &str, what: &str) -> Result<Bytes> {
+    hex::decode(s)
+        .map(Bytes::from)
+        .map_err(|e| Error::Config(format!("{what} is not valid hex ({s:?}): {e}")))
 }
 
 #[cfg(test)]
@@ -207,13 +188,22 @@ mod tests {
 
     fn entry(watermark: Lsn, lo: &str, hi: &str) -> FileEntry {
         FileEntry {
-            location: format!("s3://warehouse/data/{watermark}.parquet"),
+            location: format!("hg/main/kv/{watermark}.parquet"),
             watermark,
             pk_min: Bytes::copy_from_slice(lo.as_bytes()),
             pk_max: Bytes::copy_from_slice(hi.as_bytes()),
             file_size: 1024,
             record_count: 10,
+            bloom: None,
         }
+    }
+
+    #[test]
+    fn a_missing_bloom_cannot_prune() {
+        // A file with no bloom must answer "maybe" for every key — never a false
+        // negative, which would drop data.
+        let e = entry(1, "a", "z");
+        assert!(e.bloom_may_contain(b"anything"));
     }
 
     #[test]
@@ -248,14 +238,21 @@ mod tests {
     }
 
     #[test]
-    fn object_path_strips_the_bucket() {
+    fn object_path_is_the_bucket_relative_key() {
         let e = FileEntry {
-            location: "s3://warehouse/holy_grail/kv/data/wm-42-0.parquet".to_string(),
+            location: "hg/main/kv/ducklake-42.parquet".to_string(),
             ..entry(42, "a", "z")
         };
         assert_eq!(
             e.object_path("warehouse").as_ref(),
-            "holy_grail/kv/data/wm-42-0.parquet"
+            "hg/main/kv/ducklake-42.parquet"
         );
+    }
+
+    #[test]
+    fn hex_bounds_decode_to_raw_bytes() {
+        // "k1" and "k999" as DuckLake stores them.
+        assert_eq!(&decode_hex("6B31", "pk").unwrap()[..], b"k1");
+        assert_eq!(&decode_hex("6B393939", "pk").unwrap()[..], b"k999");
     }
 }
